@@ -23,7 +23,9 @@ from .types import (
     AlertLevel,
     BoundedSignal,
     CausalExplanation,
+    HumanAuthorityPolicy,
     SystemSnapshot,
+    TemporalConfig,
     TransitionRecord,
 )
 
@@ -58,9 +60,15 @@ QUORUM_SIZE = 2  # Minimum agents required for any escalation
 
 def inv_no_single_agent_escalation(
     record: TransitionRecord,
+    human_override: bool = False,
 ) -> InvariantResult:
     """INV-1: Escalation requires multi-agent quorum."""
     name = "INV-1:NoSingleAgentEscalation"
+
+    # Human overrides and governance transitions bypass quorum
+    if human_override:
+        return InvariantResult(name=name, holds=True,
+                               description="Human override — quorum bypassed by design")
 
     # De-escalation and lateral transitions are unrestricted
     if record.to_state <= record.from_state:
@@ -111,9 +119,17 @@ def inv_no_single_agent_escalation(
 def inv_severity_monotonic_with_certainty(
     before: SystemSnapshot,
     after: SystemSnapshot,
+    human_override: bool = False,
 ) -> InvariantResult:
     """INV-2: Alert level changes must be justified by certainty changes."""
     name = "INV-2:SeverityMonotonicWithCertainty"
+
+    # Human overrides and governance transitions bypass certainty monotonicity
+    if human_override:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Human/governance override — certainty check bypassed",
+        )
 
     if after.alert_level > before.alert_level:
         if after.net_certainty <= before.net_certainty:
@@ -380,9 +396,17 @@ def inv_signal_bounds(
 
 def inv_no_level_skipping(
     record: TransitionRecord,
+    human_override: bool = False,
 ) -> InvariantResult:
     """INV-8: Alert level changes by at most one step (except SAFE)."""
     name = "INV-8:NoLevelSkipping"
+
+    # Human overrides may skip levels — they represent external confirmation
+    if human_override:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Human override — level skipping allowed by design",
+        )
 
     if record.to_state == AlertLevel.SAFE:
         return InvariantResult(
@@ -423,6 +447,175 @@ def inv_no_level_skipping(
 
 
 # ---------------------------------------------------------------------------
+# INV-9: Automated Actions Bounded by Human Authority
+# ---------------------------------------------------------------------------
+# Formal statement:
+#   ∀ automated transitions T (not human_override):
+#     T.to_state ≤ policy.max_automated_level
+#     ∧ (policy.confirmed_requires_human ∧ T.to_state = CONFIRMED)
+#       → T is human_override
+#
+# English: Automated logic cannot escalate beyond the configured
+# authority ceiling. CONFIRMED level requires explicit human
+# confirmation unless the policy is explicitly relaxed.
+
+DEFAULT_AUTHORITY_POLICY = HumanAuthorityPolicy()
+
+
+def inv_authority_bounds(
+    record: TransitionRecord,
+    human_override: bool = False,
+    policy: HumanAuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+) -> InvariantResult:
+    """INV-9: Automated escalation respects human authority bounds."""
+    name = "INV-9:AuthorityBounds"
+
+    # De-escalation and lateral transitions are unrestricted
+    if record.to_state <= record.from_state:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Not an escalation — authority check trivially holds",
+        )
+
+    # Human overrides are not bounded by automation limits
+    if human_override:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Human override — authority check bypassed",
+        )
+
+    # Check: automated escalation must not exceed max_automated_level
+    if record.to_state > policy.max_automated_level:
+        return InvariantResult(
+            name=name, holds=False,
+            description="Automated escalation exceeds authority ceiling",
+            violation_detail=(
+                f"Automated transition to {record.to_state.name} exceeds "
+                f"max_automated_level={policy.max_automated_level.name}"
+            ),
+        )
+
+    # Check: CONFIRMED requires human if policy says so
+    if (policy.confirmed_requires_human
+            and record.to_state == AlertLevel.CONFIRMED):
+        return InvariantResult(
+            name=name, holds=False,
+            description="CONFIRMED requires human authorization",
+            violation_detail=(
+                "Policy requires human confirmation for CONFIRMED level "
+                "but this is an automated transition"
+            ),
+        )
+
+    return InvariantResult(
+        name=name, holds=True,
+        description=f"Automated escalation within authority bounds",
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV-10: Minimum Dwell Time
+# ---------------------------------------------------------------------------
+# Formal statement:
+#   ∀ transitions T where T.to_state > T.from_state:
+#     before.ticks_in_current_level ≥ min_dwell(T.from_state)
+#
+# English: The system must remain at a level for a minimum number of
+# ticks before it can escalate further. This prevents panic under burst noise.
+
+DEFAULT_TEMPORAL_CONFIG = TemporalConfig()
+
+
+def inv_min_dwell_time(
+    before: SystemSnapshot,
+    record: TransitionRecord,
+    human_override: bool = False,
+    config: TemporalConfig = DEFAULT_TEMPORAL_CONFIG,
+) -> InvariantResult:
+    """INV-10: Minimum dwell time before escalation."""
+    name = "INV-10:MinDwellTime"
+
+    # Only applies to escalation
+    if record.to_state <= record.from_state:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Not an escalation — dwell check trivially holds",
+        )
+
+    # Human overrides bypass dwell time
+    if human_override:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Human override — dwell check bypassed",
+        )
+
+    # Governance transitions (to/from SAFE) bypass dwell time
+    if record.from_state == AlertLevel.SAFE or record.to_state == AlertLevel.SAFE:
+        return InvariantResult(
+            name=name, holds=True,
+            description="Governance transition — dwell check bypassed",
+        )
+
+    level_name = record.from_state.name
+    min_dwell = config.min_dwell_ticks.get(level_name, 0)
+
+    if before.ticks_in_current_level < min_dwell:
+        return InvariantResult(
+            name=name, holds=False,
+            description="Escalation before minimum dwell time",
+            violation_detail=(
+                f"At {level_name} for {before.ticks_in_current_level} ticks, "
+                f"minimum required is {min_dwell}"
+            ),
+        )
+
+    return InvariantResult(
+        name=name, holds=True,
+        description=(
+            f"Dwell time {before.ticks_in_current_level} >= "
+            f"min {min_dwell} for {level_name}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV-11: Alert Rate Limit
+# ---------------------------------------------------------------------------
+# Formal statement:
+#   ∀ windows W of length alert_rate_limit_window ticks:
+#     |{transitions T in W where T.from_state ≠ T.to_state}|
+#       ≤ alert_rate_limit_max
+#
+# English: The system cannot emit more than N alerts within a given
+# time window. This prevents alert flooding under adversarial input.
+
+def inv_alert_rate_limit(
+    snapshot: SystemSnapshot,
+    config: TemporalConfig = DEFAULT_TEMPORAL_CONFIG,
+) -> InvariantResult:
+    """INV-11: Alert emission rate is bounded."""
+    name = "INV-11:AlertRateLimit"
+
+    if snapshot.alert_emissions_in_window > config.alert_rate_limit_max:
+        return InvariantResult(
+            name=name, holds=False,
+            description="Alert rate limit exceeded",
+            violation_detail=(
+                f"{snapshot.alert_emissions_in_window} alerts in window, "
+                f"limit is {config.alert_rate_limit_max}"
+            ),
+        )
+
+    return InvariantResult(
+        name=name, holds=True,
+        description=(
+            f"{snapshot.alert_emissions_in_window} alerts in window "
+            f"(limit {config.alert_rate_limit_max})"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Invariant Registry — all invariants in one place
 # ---------------------------------------------------------------------------
 
@@ -435,6 +628,9 @@ ALL_INVARIANT_NAMES = (
     "INV-6:CausalExplanationRequired",
     "INV-7:SignalBounds",
     "INV-8:NoLevelSkipping",
+    "INV-9:AuthorityBounds",
+    "INV-10:MinDwellTime",
+    "INV-11:AlertRateLimit",
 )
 
 
@@ -443,6 +639,7 @@ def check_all_snapshot_invariants(snapshot: SystemSnapshot) -> List[InvariantRes
     return [
         inv_uncertainty_surfaced(snapshot),
         inv_signal_bounds(snapshot),
+        inv_alert_rate_limit(snapshot),
     ]
 
 
@@ -454,11 +651,14 @@ def check_all_transition_invariants(
 ) -> List[InvariantResult]:
     """Check all invariants that apply to a state transition."""
     return [
-        inv_no_single_agent_escalation(record),
-        inv_severity_monotonic_with_certainty(before, after),
+        inv_no_single_agent_escalation(record, human_override),
+        inv_severity_monotonic_with_certainty(before, after, human_override),
         inv_safe_mode_blocks_escalation(before, after, human_override),
         inv_uncertainty_surfaced(after),
         inv_causal_explanation_required(record),
         inv_signal_bounds(after),
-        inv_no_level_skipping(record),
+        inv_no_level_skipping(record, human_override),
+        inv_authority_bounds(record, human_override),
+        inv_min_dwell_time(before, record, human_override),
+        inv_alert_rate_limit(after),
     ]

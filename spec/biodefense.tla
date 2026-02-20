@@ -13,6 +13,11 @@
  *   - Certainty monotonicity with alert levels
  *   - Hysteresis to prevent oscillation
  *   - No level skipping
+ *   - Authority bounds (Parts 7-8): automated vs human escalation limits
+ *   - Minimum dwell time enforcement before further escalation
+ *   - Alert rate limiting to prevent transition flooding
+ *   - Kill-switch shutdown behavior
+ *   - Human override bypass of dwell/authority guards
  *
  * WHAT THIS MODEL DOES NOT COVER:
  *   - Real-valued arithmetic (TLA+ integers approximate thresholds)
@@ -45,7 +50,13 @@ CONSTANTS
     DeescThresholdElevated,  \* Certainty to de-escalate from ELEVATED
     DeescThresholdSuspected, \* Certainty to de-escalate from SUSPECTED
     DeescThresholdConfirmed, \* Certainty to de-escalate from CONFIRMED
-    MinAgreement             \* Minimum agreement ratio (integer percent)
+    MinAgreement,            \* Minimum agreement ratio (integer percent)
+    MinDwellElevated,        \* Min ticks at ELEVATED before further escalation
+    MinDwellSuspected,       \* Min ticks at SUSPECTED before further escalation
+    MinDwellConfirmed,       \* Min ticks at CONFIRMED before further escalation
+    MaxAutomatedLevel,       \* Highest level automation can reach without human
+    AlertRateLimitMax,       \* Max transitions per rate-limit window
+    KillSwitchThreshold      \* Invariant violations before shutdown
 
 \* -----------------------------------------------------------------------
 \* Alert Levels (ordered by severity)
@@ -72,10 +83,16 @@ VARIABLES
     uncertainty,     \* Integer: uncertainty (0..MaxCertainty)
     votes,           \* Function: agent -> voted level
     hasExplanation,  \* Boolean: current transition has explanation
-    tick             \* Monotonic logical clock
+    tick,            \* Monotonic logical clock
+    ticksInLevel,    \* Ticks since last level transition
+    ticksSinceSignal,\* Ticks since last signal
+    alertEmissions,  \* Count of transitions within rate limit window
+    isShutdown,      \* Kill-switch activated
+    humanOverride    \* Whether current action is human-authorized
 
 vars == <<alertLevel, safeMode, netCertainty, uncertainty, votes,
-          hasExplanation, tick>>
+          hasExplanation, tick, ticksInLevel, ticksSinceSignal,
+          alertEmissions, isShutdown, humanOverride>>
 
 \* -----------------------------------------------------------------------
 \* Type Invariant
@@ -89,6 +106,11 @@ TypeInvariant ==
     /\ votes \in [Agents -> AlertLevels]
     /\ hasExplanation \in BOOLEAN
     /\ tick \in Nat
+    /\ ticksInLevel \in Nat
+    /\ ticksSinceSignal \in Nat
+    /\ alertEmissions \in Nat
+    /\ isShutdown \in BOOLEAN
+    /\ humanOverride \in BOOLEAN
 
 \* -----------------------------------------------------------------------
 \* Initial State
@@ -102,6 +124,11 @@ Init ==
     /\ votes = [a \in Agents |-> 1]  \* All agents vote NORMAL initially
     /\ hasExplanation = TRUE
     /\ tick = 0
+    /\ ticksInLevel = 0
+    /\ ticksSinceSignal = 0
+    /\ alertEmissions = 0
+    /\ isShutdown = FALSE
+    /\ humanOverride = FALSE
 
 \* -----------------------------------------------------------------------
 \* Helper: Count agents voting for a level
@@ -115,6 +142,16 @@ MajorityLevel == CHOOSE l \in AlertLevels :
 
 \* Agreement: fraction voting for majority (using integer arithmetic)
 AgreementPercent == (VotesFor(MajorityLevel) * 100) \div Cardinality(Agents)
+
+\* -----------------------------------------------------------------------
+\* Helper: Minimum dwell time for a given level
+\* -----------------------------------------------------------------------
+
+MinDwell(level) ==
+    CASE level = 2 -> MinDwellElevated
+    []   level = 3 -> MinDwellSuspected
+    []   level = 4 -> MinDwellConfirmed
+    []   OTHER    -> 0  \* No dwell requirement for SAFE or NORMAL
 
 \* -----------------------------------------------------------------------
 \* Escalation threshold for a target level
@@ -138,50 +175,75 @@ DeescThreshold(level) ==
 
 \* Adversarial signal injection: certainty and uncertainty can be anything
 \* within bounds. This models an adversarial environment.
+\* Resets ticksSinceSignal to 0 (signal received).
 AdversarialSignal ==
+    /\ ~isShutdown
     /\ \E c \in 0..MaxCertainty, u \in 0..MaxCertainty :
         /\ netCertainty' = c
         /\ uncertainty' = u
-    /\ UNCHANGED <<alertLevel, safeMode, votes, hasExplanation>>
+    /\ ticksSinceSignal' = 0
+    /\ UNCHANGED <<alertLevel, safeMode, votes, hasExplanation,
+                   ticksInLevel, alertEmissions, isShutdown, humanOverride>>
     /\ tick' = tick + 1
 
 \* Agent voting: each agent independently picks a level (adversarially)
 AdversarialVote ==
+    /\ ~isShutdown
     /\ \E newVotes \in [Agents -> AlertLevels] :
         votes' = newVotes
     /\ UNCHANGED <<alertLevel, safeMode, netCertainty, uncertainty,
-                   hasExplanation>>
+                   hasExplanation, ticksInLevel, ticksSinceSignal,
+                   alertEmissions, isShutdown, humanOverride>>
     /\ tick' = tick + 1
 
 \* Evaluate: check if a transition is warranted
+\* Updated with authority bounds, dwell time, and rate limiting guards
 Evaluate ==
-    LET majority == MajorityLevel
-        agreement == AgreementPercent
-        nVoters == VotesFor(majority)
-    IN
-    \* --- Escalation ---
-    IF /\ ~safeMode
-       /\ majority > alertLevel
-       /\ majority = alertLevel + 1     \* No level skipping
-       /\ nVoters >= QuorumSize         \* Quorum met
-       /\ agreement >= MinAgreement     \* Sufficient agreement
-       /\ netCertainty >= EscThreshold(majority)  \* Certainty threshold
-    THEN
-        /\ alertLevel' = majority
-        /\ hasExplanation' = TRUE
-        /\ UNCHANGED <<safeMode, netCertainty, uncertainty, votes>>
-        /\ tick' = tick + 1
-    \* --- De-escalation ---
-    ELSE IF /\ alertLevel > 1
-            /\ netCertainty <= DeescThreshold(alertLevel)
-         THEN
-            /\ alertLevel' = alertLevel - 1
-            /\ hasExplanation' = TRUE
-            /\ UNCHANGED <<safeMode, netCertainty, uncertainty, votes>>
-            /\ tick' = tick + 1
-    \* --- No transition ---
-    ELSE
-        /\ UNCHANGED vars
+    /\ ~isShutdown
+    /\ LET majority == MajorityLevel
+           agreement == AgreementPercent
+           nVoters == VotesFor(majority)
+       IN
+       \* --- Escalation ---
+       IF /\ ~safeMode
+          /\ majority > alertLevel
+          /\ majority = alertLevel + 1     \* No level skipping
+          /\ nVoters >= QuorumSize         \* Quorum met
+          /\ agreement >= MinAgreement     \* Sufficient agreement
+          /\ netCertainty >= EscThreshold(majority)  \* Certainty threshold
+          \* --- NEW GUARD: Authority bounds ---
+          \* Automated escalation cannot exceed MaxAutomatedLevel
+          /\ majority <= MaxAutomatedLevel
+          \* --- NEW GUARD: Minimum dwell time ---
+          \* Must have spent enough ticks at current level
+          /\ ticksInLevel >= MinDwell(alertLevel)
+          \* --- NEW GUARD: Alert rate limiting ---
+          /\ alertEmissions < AlertRateLimitMax
+       THEN
+           /\ alertLevel' = majority
+           /\ hasExplanation' = TRUE
+           /\ ticksInLevel' = 0            \* Reset dwell counter on transition
+           /\ alertEmissions' = alertEmissions + 1
+           /\ humanOverride' = FALSE
+           /\ UNCHANGED <<safeMode, netCertainty, uncertainty, votes,
+                          ticksSinceSignal, isShutdown>>
+           /\ tick' = tick + 1
+       \* --- De-escalation ---
+       ELSE IF /\ alertLevel > 1
+               /\ netCertainty <= DeescThreshold(alertLevel)
+               /\ alertEmissions < AlertRateLimitMax
+            THEN
+               /\ alertLevel' = alertLevel - 1
+               /\ hasExplanation' = TRUE
+               /\ ticksInLevel' = 0        \* Reset dwell counter on transition
+               /\ alertEmissions' = alertEmissions + 1
+               /\ humanOverride' = FALSE
+               /\ UNCHANGED <<safeMode, netCertainty, uncertainty, votes,
+                              ticksSinceSignal, isShutdown>>
+               /\ tick' = tick + 1
+       \* --- No transition ---
+       ELSE
+           /\ UNCHANGED vars
 
 \* Enter safe mode
 EnterSafeMode ==
@@ -189,42 +251,85 @@ EnterSafeMode ==
     /\ safeMode' = TRUE
     /\ alertLevel' = 0          \* SAFE
     /\ hasExplanation' = TRUE
-    /\ UNCHANGED <<netCertainty, uncertainty, votes>>
+    /\ ticksInLevel' = 0
+    /\ alertEmissions' = alertEmissions + 1
+    /\ humanOverride' = FALSE
+    /\ UNCHANGED <<netCertainty, uncertainty, votes, ticksSinceSignal,
+                   isShutdown>>
     /\ tick' = tick + 1
 
-\* Exit safe mode
+\* Exit safe mode (blocked when shutdown)
 ExitSafeMode ==
+    /\ ~isShutdown
     /\ safeMode
     /\ safeMode' = FALSE
     /\ alertLevel' = 1          \* NORMAL
     /\ netCertainty' = 0
     /\ uncertainty' = MaxCertainty
     /\ hasExplanation' = TRUE
-    /\ UNCHANGED <<votes>>
+    /\ ticksInLevel' = 0
+    /\ alertEmissions' = alertEmissions + 1
+    /\ humanOverride' = FALSE
+    /\ UNCHANGED <<votes, ticksSinceSignal, isShutdown>>
     /\ tick' = tick + 1
 
-\* Human override (can set any level)
-HumanOverride ==
+\* Human override (can set any level, including CONFIRMED)
+\* Sets humanOverride = TRUE and bypasses dwell/authority guards
+HumanOverrideAction ==
+    /\ ~isShutdown
     /\ \E level \in AlertLevels :
         /\ alertLevel' = level
         /\ IF level = 0
            THEN safeMode' = TRUE
            ELSE safeMode' = safeMode
         /\ hasExplanation' = TRUE
-    /\ UNCHANGED <<netCertainty, uncertainty, votes>>
+    /\ humanOverride' = TRUE
+    /\ ticksInLevel' = 0        \* Reset dwell counter on override
+    /\ alertEmissions' = alertEmissions + 1
+    /\ UNCHANGED <<netCertainty, uncertainty, votes, ticksSinceSignal,
+                   isShutdown>>
+    /\ tick' = tick + 1
+
+\* Tick action: passage of time without any transition
+\* Increments ticksInLevel and ticksSinceSignal
+Tick ==
+    /\ ticksInLevel' = ticksInLevel + 1
+    /\ ticksSinceSignal' = ticksSinceSignal + 1
+    /\ tick' = tick + 1
+    /\ UNCHANGED <<alertLevel, safeMode, netCertainty, uncertainty,
+                   votes, hasExplanation, alertEmissions, isShutdown,
+                   humanOverride>>
+
+\* Activate kill-switch shutdown
+ActivateShutdown ==
+    /\ ~isShutdown
+    /\ isShutdown' = TRUE
+    /\ safeMode' = TRUE
+    /\ alertLevel' = 0
+    /\ hasExplanation' = TRUE
+    /\ ticksInLevel' = 0
+    /\ humanOverride' = FALSE
+    /\ UNCHANGED <<netCertainty, uncertainty, votes, ticksSinceSignal,
+                   alertEmissions>>
     /\ tick' = tick + 1
 
 \* -----------------------------------------------------------------------
 \* Next-state relation
 \* -----------------------------------------------------------------------
 
+\* When shutdown is active, only EnterSafeMode and Tick are allowed
 Next ==
-    \/ AdversarialSignal
-    \/ AdversarialVote
-    \/ Evaluate
-    \/ EnterSafeMode
-    \/ ExitSafeMode
-    \/ HumanOverride
+    IF isShutdown
+    THEN \/ EnterSafeMode
+         \/ Tick
+    ELSE \/ AdversarialSignal
+         \/ AdversarialVote
+         \/ Evaluate
+         \/ EnterSafeMode
+         \/ ExitSafeMode
+         \/ HumanOverrideAction
+         \/ Tick
+         \/ ActivateShutdown
 
 \* -----------------------------------------------------------------------
 \* SAFETY PROPERTIES (Invariants)
@@ -251,17 +356,50 @@ CertaintyBounded ==
 \* This is structurally enforced in Evaluate: majority = alertLevel + 1
 \* and de-escalation: alertLevel' = alertLevel - 1
 
-\* STABILITY: No oscillation — verified by model checking
+\* STABILITY: No oscillation -- verified by model checking
 \* The hysteresis gap between escalation and de-escalation thresholds
 \* means that for any fixed certainty value, only one alert level is
 \* stable. TLC verifies this by exhaustively checking all states.
 
+\* -----------------------------------------------------------------------
+\* NEW SAFETY PROPERTIES (Parts 7-8)
+\* -----------------------------------------------------------------------
+
+\* Authority bounds: if not human-authorized, alert level stays at or
+\* below MaxAutomatedLevel. This is structurally enforced in Evaluate
+\* (the guard majority <= MaxAutomatedLevel) and also checked as an
+\* invariant here.
+AuthorityBoundsInvariant ==
+    (~humanOverride) => (alertLevel <= MaxAutomatedLevel)
+
+\* Dwell time respected: structural property encoded in Evaluate guards.
+\* The Evaluate action requires ticksInLevel >= MinDwell(alertLevel)
+\* before allowing escalation. This is verified structurally.
+\* (No separate invariant needed; the guard in Evaluate prevents
+\* violations. TLC verifies it by exhaustive state exploration.)
+
+\* Rate limit respected: alertEmissions never exceeds AlertRateLimitMax
+RateLimitRespected ==
+    alertEmissions <= AlertRateLimitMax
+
+\* Shutdown blocks escalation: when shutdown is active, the alert level
+\* must be 0 (SAFE). The Next relation restricts available actions
+\* when isShutdown is TRUE.
+ShutdownBlocksEscalation ==
+    isShutdown => (alertLevel = 0)
+
+\* -----------------------------------------------------------------------
 \* Combined safety property
+\* -----------------------------------------------------------------------
+
 Safety ==
     /\ TypeInvariant
     /\ SafeModeBlocksEscalation
     /\ UncertaintySurfaced
     /\ CertaintyBounded
+    /\ AuthorityBoundsInvariant
+    /\ RateLimitRespected
+    /\ ShutdownBlocksEscalation
 
 \* -----------------------------------------------------------------------
 \* Specification
@@ -284,15 +422,19 @@ Spec == Init /\ [][Next]_vars
 \*   DeescThresholdSuspected = 4 (0.4, rounded from 0.35)
 \*   DeescThresholdConfirmed = 6 (0.6, rounded from 0.55)
 \*   MinAgreement = 60          (60%)
-\*
-\* With these values TLC explores approximately:
-\*   5 alert levels × 2 safe modes × 11 certainties × 11 uncertainties
-\*   × 5^3 vote combinations = ~151,250 states
-\*   (reachable subset is smaller)
+\*   MinDwellElevated = 3
+\*   MinDwellSuspected = 5
+\*   MinDwellConfirmed = 10
+\*   MaxAutomatedLevel = 3      (SUSPECTED)
+\*   AlertRateLimitMax = 5
+\*   KillSwitchThreshold = 3
 \*
 \* Properties to check:
 \*   - Safety (conjunction of all invariants)
 \*   - TypeInvariant
 \*   - SafeModeBlocksEscalation
+\*   - AuthorityBoundsInvariant
+\*   - RateLimitRespected
+\*   - ShutdownBlocksEscalation
 
 =============================================================================

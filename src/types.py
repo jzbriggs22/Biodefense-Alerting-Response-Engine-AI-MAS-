@@ -14,7 +14,7 @@ import enum
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,10 @@ class SystemSnapshot:
     last_explanation: Optional[CausalExplanation]
     net_certainty: float  # Current aggregated certainty
     uncertainty: float  # Current explicit uncertainty
+    ticks_in_current_level: int = 0  # Dwell time tracking
+    ticks_since_last_signal: int = 0  # Data blackout tracking
+    alert_emissions_in_window: int = 0  # Rate limit tracking
+    is_shutdown: bool = False  # Shutdown state
 
     @property
     def snapshot_id(self) -> str:
@@ -155,6 +159,9 @@ class SystemSnapshot:
             "active_agents": sorted(self.active_agents),
             "net_certainty": self.net_certainty,
             "uncertainty": self.uncertainty,
+            "ticks_in_current_level": self.ticks_in_current_level,
+            "ticks_since_last_signal": self.ticks_since_last_signal,
+            "is_shutdown": self.is_shutdown,
         }, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -202,3 +209,74 @@ class AgentVote:
             raise ValueError(f"Vote confidence {self.confidence} out of bounds")
         if not self.agent_id:
             raise ValueError("agent_id must be non-empty")
+
+
+# ---------------------------------------------------------------------------
+# Human Authority Policy — bounds on automated action
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class HumanAuthorityPolicy:
+    """
+    Defines the maximum alert level the system may reach without
+    explicit human authorization. Automated actions are bounded
+    by these limits.
+
+    TRACEABILITY: spec/biodefense.tla :: AuthorityPolicy
+    """
+    # Maximum alert level reachable by automated escalation alone
+    max_automated_level: AlertLevel = AlertLevel.SUSPECTED
+
+    # Whether CONFIRMED requires explicit human confirmation
+    confirmed_requires_human: bool = True
+
+    def __post_init__(self):
+        if self.max_automated_level.value > AlertLevel.CONFIRMED.value:
+            raise ValueError("max_automated_level cannot exceed CONFIRMED")
+
+
+# ---------------------------------------------------------------------------
+# Temporal Configuration — dwell times, rate limits, failsafe
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TemporalConfig:
+    """
+    Temporal constraints for the state machine. These prevent panic
+    under noise and stalling under ambiguity.
+
+    All times are in logical ticks (not wall clock).
+
+    TRACEABILITY: spec/biodefense.tla :: TemporalConstraints
+    """
+    # Minimum ticks a state must be held before escalation is allowed.
+    # Prevents rapid escalation under burst noise.
+    min_dwell_ticks: Dict[str, int] = field(default_factory=lambda: {
+        "NORMAL": 0,       # Can leave NORMAL immediately
+        "ELEVATED": 3,     # Must stay ELEVATED at least 3 ticks
+        "SUSPECTED": 5,    # Must stay SUSPECTED at least 5 ticks
+        "CONFIRMED": 10,   # Must stay CONFIRMED at least 10 ticks
+        "SAFE": 0,         # Can leave SAFE immediately (governance)
+    })
+
+    # Maximum ticks a state may be held without re-evaluation producing
+    # a transition or a human acknowledgment. After this, the system
+    # flags a STALL condition.  Zero means no maximum (disabled).
+    max_dwell_ticks: Dict[str, int] = field(default_factory=lambda: {
+        "NORMAL": 0,       # No max — NORMAL is the resting state
+        "ELEVATED": 200,   # Must resolve within 200 ticks
+        "SUSPECTED": 150,  # Must resolve within 150 ticks
+        "CONFIRMED": 100,  # Must resolve within 100 ticks
+        "SAFE": 0,         # No max — SAFE is a governance hold
+    })
+
+    # Maximum alert emissions per window to prevent alert flooding.
+    # (max_alerts, window_ticks)
+    alert_rate_limit_max: int = 5
+    alert_rate_limit_window: int = 50
+
+    # After this many ticks of zero signals, flag a DATA_BLACKOUT condition.
+    data_blackout_threshold: int = 30
+
+    # Kill-switch: if invariant violations exceed this count, force SAFE mode.
+    kill_switch_violation_threshold: int = 3

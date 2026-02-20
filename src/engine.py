@@ -34,7 +34,9 @@ from .types import (
     AgentVote,
     AlertLevel,
     BoundedSignal,
+    HumanAuthorityPolicy,
     SystemSnapshot,
+    TemporalConfig,
     TransitionRecord,
 )
 
@@ -44,6 +46,12 @@ class EngineConfig:
     """Configuration for the biodefense engine."""
     thresholds: TransitionThresholds = field(
         default_factory=TransitionThresholds
+    )
+    authority_policy: HumanAuthorityPolicy = field(
+        default_factory=HumanAuthorityPolicy
+    )
+    temporal_config: TemporalConfig = field(
+        default_factory=TemporalConfig
     )
     enable_runtime_invariant_checks: bool = True
 
@@ -66,6 +74,8 @@ class BiodefenseEngine:
         self._config = config
         self._fsm = BiodefenseStateMachine(
             thresholds=config.thresholds,
+            authority_policy=config.authority_policy,
+            temporal_config=config.temporal_config,
         )
         self._agents: Dict[str, BaseAgent] = {}
         self._all_signals: List[BoundedSignal] = []

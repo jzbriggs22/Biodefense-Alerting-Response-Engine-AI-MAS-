@@ -30,7 +30,9 @@ from .types import (
     AlertLevel,
     BoundedSignal,
     CausalExplanation,
+    HumanAuthorityPolicy,
     SystemSnapshot,
+    TemporalConfig,
     TransitionRecord,
 )
 
@@ -213,8 +215,12 @@ class BiodefenseStateMachine:
         self,
         thresholds: TransitionThresholds = DEFAULT_THRESHOLDS,
         initial_level: AlertLevel = AlertLevel.NORMAL,
+        authority_policy: HumanAuthorityPolicy = HumanAuthorityPolicy(),
+        temporal_config: TemporalConfig = TemporalConfig(),
     ):
         self._thresholds = thresholds
+        self._authority_policy = authority_policy
+        self._temporal_config = temporal_config
         self._tick = 0
         self._alert_level = initial_level
         self._safe_mode = False
@@ -226,12 +232,23 @@ class BiodefenseStateMachine:
         self._last_explanation: Optional[CausalExplanation] = None
         self._transition_log: List[TransitionRecord] = []
         self._invariant_violations: List[InvariantResult] = []
+        # Temporal tracking
+        self._ticks_in_current_level = 0
+        self._ticks_since_last_signal = 0
+        self._alert_emission_ticks: List[int] = []  # Ticks when alerts were emitted
+        self._is_shutdown = False
 
     # -- Public read-only accessors --
 
     @property
     def snapshot(self) -> SystemSnapshot:
         """Current system state as an immutable snapshot."""
+        # Count alert emissions within the rate-limit window
+        window = self._temporal_config.alert_rate_limit_window
+        emissions_in_window = sum(
+            1 for t in self._alert_emission_ticks
+            if self._tick - t < window
+        )
         return SystemSnapshot(
             tick=self._tick,
             alert_level=self._alert_level,
@@ -241,6 +258,10 @@ class BiodefenseStateMachine:
             last_explanation=self._last_explanation,
             net_certainty=self._net_certainty,
             uncertainty=self._uncertainty,
+            ticks_in_current_level=self._ticks_in_current_level,
+            ticks_since_last_signal=self._ticks_since_last_signal,
+            alert_emissions_in_window=emissions_in_window,
+            is_shutdown=self._is_shutdown,
         )
 
     @property
@@ -262,6 +283,12 @@ class BiodefenseStateMachine:
 
         TRACEABILITY: spec/biodefense.tla :: Next
         """
+        # Shutdown blocks all events except safe mode entry
+        if self._is_shutdown and event.event_type != EVENT_SAFE_MODE_ENTER:
+            self._tick += 1
+            self._ticks_in_current_level += 1
+            return self.snapshot
+
         before = self.snapshot
 
         if event.event_type == EVENT_SAFE_MODE_ENTER:
@@ -270,18 +297,31 @@ class BiodefenseStateMachine:
             self._exit_safe_mode(before, event)
         elif event.event_type == EVENT_SIGNALS_RECEIVED:
             self._process_signals(before, event)
+            self._ticks_since_last_signal = 0  # Reset blackout counter
         elif event.event_type == EVENT_VOTE_COMPLETE:
             self._process_votes(before, event)
         elif event.event_type == EVENT_HUMAN_OVERRIDE:
             self._process_human_override(before, event)
         elif event.event_type == EVENT_TICK:
             self._process_tick(before, event)
+            self._ticks_since_last_signal += 1
         else:
             # Unknown event type — do nothing. This is deliberate:
             # unknown events are not errors, they are no-ops.
             pass
 
         self._tick += 1
+        self._ticks_in_current_level += 1
+
+        # Kill-switch: too many invariant violations → force safe mode
+        threshold = self._temporal_config.kill_switch_violation_threshold
+        if (len(self._invariant_violations) >= threshold
+                and not self._safe_mode
+                and not self._is_shutdown):
+            self._is_shutdown = True
+            self._safe_mode = True
+            self._alert_level = AlertLevel.SAFE
+
         return self.snapshot
 
     def _enter_safe_mode(self, before: SystemSnapshot, event: Event) -> None:
@@ -304,7 +344,8 @@ class BiodefenseStateMachine:
             to_level=AlertLevel.SAFE,
         )
         self._last_explanation = explanation
-        self._record_transition(before, explanation)
+        # Governance actions are treated as human-authorized
+        self._record_transition(before, explanation, human_override=True)
 
     def _exit_safe_mode(self, before: SystemSnapshot, event: Event) -> None:
         """Exit SAFE mode, returning to NORMAL."""
@@ -328,7 +369,8 @@ class BiodefenseStateMachine:
             to_level=AlertLevel.NORMAL,
         )
         self._last_explanation = explanation
-        self._record_transition(before, explanation)
+        # Governance actions are treated as human-authorized
+        self._record_transition(before, explanation, human_override=True)
 
     def _process_signals(self, before: SystemSnapshot, event: Event) -> None:
         """Ingest new signals and update certainty. Does NOT transition state."""
@@ -361,7 +403,9 @@ class BiodefenseStateMachine:
             agreement_ratio=agreement_ratio,
             majority_level=majority_level,
             n_signals=len(self._pending_signals),
-            n_agents=len(set(v.agent_id for v in event.votes)),
+            n_agents=len(set(
+                v.agent_id for v in event.votes if v.confidence > 0
+            )),
         )
 
         if proposed_level == self._alert_level:
@@ -466,6 +510,8 @@ class BiodefenseStateMachine:
         TRACEABILITY: spec/biodefense.tla :: EvaluateTransition
         """
         t = self._thresholds
+        tc = self._temporal_config
+        ap = self._authority_policy
 
         # Safe mode: no automated escalation
         if self._safe_mode:
@@ -475,6 +521,26 @@ class BiodefenseStateMachine:
         if majority_level > current_level:
             # Can only go up one step
             target = AlertLevel(current_level.value + 1)
+
+            # Authority bounds: automated escalation cannot exceed ceiling
+            if target > ap.max_automated_level:
+                return current_level
+            if ap.confirmed_requires_human and target == AlertLevel.CONFIRMED:
+                return current_level
+
+            # Minimum dwell time: must stay at current level long enough
+            min_dwell = tc.min_dwell_ticks.get(current_level.name, 0)
+            if self._ticks_in_current_level < min_dwell:
+                return current_level
+
+            # Alert rate limit: check emissions in window
+            window = tc.alert_rate_limit_window
+            recent_emissions = sum(
+                1 for et in self._alert_emission_ticks
+                if self._tick - et < window
+            )
+            if recent_emissions >= tc.alert_rate_limit_max:
+                return current_level
 
             # Check all guards
             if n_agents < t.min_quorum_agents:
@@ -573,8 +639,10 @@ class BiodefenseStateMachine:
 
         self._transition_log.append(record)
 
-        # Update level-entry certainty after recording
+        # Update level-entry certainty and reset dwell counter
         self._certainty_at_level_entry = self._net_certainty
+        self._ticks_in_current_level = 0
+        self._alert_emission_ticks.append(self._tick)
 
         if violations:
             self._invariant_violations.extend(violations)

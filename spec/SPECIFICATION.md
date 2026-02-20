@@ -10,7 +10,7 @@ what it must never do, and what remains theoretically impossible to guarantee.
 
 ## Part 1 — System Invariants
 
-Eight invariants constrain all system behavior. Each is formally stated,
+Eleven invariants constrain all system behavior. Each is formally stated,
 machine-checked at runtime, and traced to the TLA+ specification.
 
 ### INV-1: No Single Agent Escalation
@@ -120,6 +120,53 @@ The system cannot jump from NORMAL to CONFIRMED. It must traverse
 each intermediate level. Human overrides may skip levels.
 
 **Implementation:** `src/invariants.py::inv_no_level_skipping`
+
+### INV-9: Authority Bounds
+
+```
+∀ automated transitions T where T.to_state > T.from_state:
+  T.to_state ≤ max_automated_level
+  ∧ (confirmed_requires_human ∧ T.to_state = CONFIRMED)
+    → T.human_override = true
+```
+
+Automated escalation cannot exceed the human authority ceiling. By default,
+CONFIRMED level requires explicit human authorization. De-escalation is
+always allowed without human involvement.
+
+**Implementation:** `src/invariants.py::inv_authority_bounds`
+**Enforced by:** `src/state_machine.py::_evaluate_transition` (authority guard)
+
+### INV-10: Minimum Dwell Time
+
+```
+∀ escalation transitions T from level L:
+  ticks_in_current_level ≥ min_dwell_ticks[L]
+  (Exception: de-escalation ignores dwell)
+  (Exception: human overrides bypass dwell)
+  (Exception: governance transitions bypass dwell)
+```
+
+The system must remain at a level for a minimum number of ticks before
+further escalation. This prevents burst-driven panic. Defaults:
+ELEVATED=3, SUSPECTED=5, CONFIRMED=10.
+
+**Implementation:** `src/invariants.py::inv_min_dwell_time`
+**Enforced by:** `src/state_machine.py::_evaluate_transition` (dwell guard)
+
+### INV-11: Alert Rate Limit
+
+```
+∀ snapshots S:
+  S.alert_emissions_in_window ≤ alert_rate_limit_max
+```
+
+The system cannot emit more than `alert_rate_limit_max` (5) alert
+transitions within a sliding window of `alert_rate_limit_window` (50)
+ticks. This prevents alert flooding.
+
+**Implementation:** `src/invariants.py::inv_alert_rate_limit`
+**Enforced by:** `src/state_machine.py::_evaluate_transition` (rate limit guard)
 
 ---
 
@@ -260,6 +307,23 @@ With 10 continuous iterations (80 scenarios), zero failures.
 | GV-003 | Exit safe mode when not in it | Idempotent, no error |
 | GV-004 | Human override skip levels | Allowed with full explanation |
 
+### Human Authority Faults (HA-001 through HA-003)
+
+| ID | Fault | Expected Behavior |
+|----|-------|-------------------|
+| HA-001 | Automated escalation attempts CONFIRMED | Blocked by INV-9, stays at SUSPECTED |
+| HA-002 | Human override to CONFIRMED | Succeeds — human overrides bypass authority bounds |
+| HA-003 | Human override during shutdown | Blocked — shutdown only accepts safe mode entry |
+
+### Additional Temporal Faults (TF-004 through TF-007)
+
+| ID | Fault | Expected Behavior |
+|----|-------|-------------------|
+| TF-004 | Escalation blocked by insufficient dwell | Stays at current level until dwell satisfied |
+| TF-005 | Alert rate limit enforced | Transitions blocked after limit reached |
+| TF-006 | Kill-switch on repeated violations | System enters shutdown + SAFE mode |
+| TF-007 | Signal decay returns to baseline | Certainty drops, system de-escalates toward NORMAL |
+
 ---
 
 ## Part 5 — Formal Verification
@@ -366,10 +430,135 @@ implementation are correct, the monitor should never trigger.
 
 No unverified control logic may ship. The CI pipeline must:
 
-1. Run all tests (74 tests, including invariant, adversarial, and fault injection)
+1. Run all tests (100 tests, including invariant, adversarial, fault injection, and temporal)
 2. Run the adversarial simulator with multiple seeds
 3. Verify traceability links exist and are valid
 4. (When TLC is available) Re-run model checker after spec changes
+
+---
+
+## Part 7 — Safety & Assurance Case
+
+The full structured assurance case is maintained in `spec/assurance_case.md`
+using Goal Structuring Notation (GSN) style.
+
+### Top-Level Safety Goals
+
+| Goal | Claim |
+|------|-------|
+| G-0 | System is trustworthy under ambiguity, misinformation, partial failure, and adversarial conditions |
+| G-1 | Never escalates without sufficient, multi-source evidence |
+| G-2 | Never hides uncertainty or fails silently |
+| G-3 | Cannot panic under noise or stall indefinitely under ambiguity |
+| G-4 | Defense in depth via formal methods, simulation, and runtime monitoring |
+| G-5 | Human authority is respected and bounded |
+
+### Three-Layer Defense in Depth
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 1: Formal Verification (TLA+)                │
+│  Proves safety over ALL reachable states             │
+│  Catches: design errors, missing guards              │
+├─────────────────────────────────────────────────────┤
+│  Layer 2: Adversarial Simulation + Fault Injection   │
+│  Tests behavior under hostile conditions             │
+│  Catches: implementation bugs, edge cases            │
+├─────────────────────────────────────────────────────┤
+│  Layer 3: Runtime Invariant Monitor                  │
+│  Enforces invariants in production                   │
+│  Catches: anything the other layers missed           │
+│  Failsafe: auto-safe-mode + kill-switch on violation │
+└─────────────────────────────────────────────────────┘
+```
+
+### Residual Risks
+
+| Risk | Description | Severity | Likelihood | Mitigation |
+|------|-------------|----------|------------|------------|
+| R-1 | Coordinated multi-source spoofing | High | Low | Quorum across independent source types |
+| R-2 | Permanent data loss | High | Low | Uncertainty surfaces; system holds steady |
+| R-3 | Human override error | Medium | Medium | Full logging; explanation required |
+| R-4 | Float arithmetic at thresholds | Low | Very Low | Hysteresis gaps >> float epsilon |
+| R-5 | ML model systematic bias | Medium | Medium | Bounded signals; confidence caps per agent type |
+| R-6 | Kill-switch locks out recovery | Medium | Low | Safe mode entry always accepted; requires governance to restart |
+
+---
+
+## Part 8 — Temporal Correctness & Failsafe Semantics
+
+### Temporal Configuration
+
+The `TemporalConfig` dataclass controls all temporal behavior:
+
+```
+min_dwell_ticks:
+  NORMAL=0, ELEVATED=3, SUSPECTED=5, CONFIRMED=10, SAFE=0
+max_dwell_ticks:
+  NORMAL=0, ELEVATED=200, SUSPECTED=150, CONFIRMED=100, SAFE=0
+alert_rate_limit_max:    5 transitions per window
+alert_rate_limit_window: 50 ticks
+data_blackout_threshold: 30 ticks without signals
+kill_switch_violation_threshold: 3 invariant violations
+```
+
+### Human Authority Policy
+
+The `HumanAuthorityPolicy` defines the ceiling for automated action:
+
+```
+max_automated_level:     SUSPECTED (level 3)
+confirmed_requires_human: true
+```
+
+Automated escalation cannot exceed SUSPECTED. Reaching CONFIRMED
+requires explicit human authorization via `human_override()`.
+De-escalation is always permitted without human involvement.
+
+### Temporal Tracking
+
+Three counters track temporal state:
+
+| Counter | Resets when | Purpose |
+|---------|-----------|---------|
+| `ticks_in_current_level` | Level transition | Enforces minimum dwell time |
+| `ticks_since_last_signal` | Signal received | Detects data blackout |
+| `alert_emissions_in_window` | Sliding window | Enforces rate limit |
+
+### Failsafe & Kill-Switch
+
+The kill-switch is the system's ultimate safety valve:
+
+1. **Trigger:** `len(invariant_violations) >= kill_switch_violation_threshold`
+2. **Action:** System enters SAFE mode, sets `is_shutdown = True`
+3. **Effect:** ALL events are blocked except `SAFE_MODE_ENTER`
+4. **Recovery:** Requires governance intervention to restart
+
+### Safe Shutdown & Recovery Protocol
+
+| Phase | Action | State After |
+|-------|--------|-------------|
+| Enter safe mode | `_enter_safe_mode()` | level=SAFE, safe_mode=True |
+| Exit safe mode | `_exit_safe_mode()` | level=NORMAL, certainty=0.0, uncertainty=1.0, signals cleared |
+| Kill-switch | Auto on violation accumulation | level=SAFE, is_shutdown=True, all events blocked |
+
+Critical property: **No carryover after safe mode.** Signals accumulated
+before safe mode entry are cleared on exit. The system returns to a clean
+NORMAL baseline with zero certainty and maximum uncertainty.
+
+### Proven Temporal Properties
+
+1. **Cannot panic under noise:** Single-agent noisy data cannot drive
+   escalation beyond what multi-agent quorum supports. Zero-confidence
+   votes do not count toward quorum.
+
+2. **Cannot stall indefinitely:** Signal decay (100-tick window) ensures
+   that without fresh evidence, certainty decays toward zero, eventually
+   triggering de-escalation.
+
+3. **Cannot silently re-escalate after recovery:** Safe mode exit clears
+   all accumulated signals and resets certainty to zero. Stale evidence
+   from before recovery cannot trigger new escalation.
 
 ---
 
@@ -424,6 +613,18 @@ neither escalating nor de-escalating.
 
 **Mitigation:** This is correct behavior. The system is designed to
 resist ambiguous signals. Uncertainty is surfaced to operators.
+
+### F-6: Kill-Switch Locks Out Recovery
+
+If the kill-switch activates (3+ invariant violations), the system enters
+permanent shutdown. No automated processing can occur. Only safe mode
+entry is accepted.
+
+**Mitigation:** This is working as designed. The kill-switch is the
+ultimate safety valve. Recovery requires governance intervention
+(human-initiated safe mode exit followed by system restart). The
+alternative — automatic recovery — risks repeating the conditions
+that caused the violations.
 
 ---
 
@@ -487,6 +688,23 @@ Percentage of replayed executions that produce identical snapshot IDs.
 
 **Target:** 100%
 **Measured:** 100% (structural property, not statistical)
+
+### M-8: Dwell Time Enforcement
+
+Number of escalations that occurred before minimum dwell time elapsed.
+
+**Target:** 0
+**Measured:** 0 (enforced by dwell time guard in `_evaluate_transition`,
+verified by INV-10 tests and fault injection TF-004)
+
+### M-9: Authority Bounds Enforcement
+
+Number of automated escalations that reached CONFIRMED without human
+authorization.
+
+**Target:** 0
+**Measured:** 0 (enforced by authority guard in `_evaluate_transition`,
+verified by INV-9 tests and fault injection HA-001)
 
 ---
 

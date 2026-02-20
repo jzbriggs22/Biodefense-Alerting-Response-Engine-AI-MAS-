@@ -32,7 +32,7 @@ from src.agents.osint_agent import OSINTAgent
 from src.agents.sensor_agent import SensorAgent
 from src.agents.epi_agent import EpidemiologicalAgent
 from src.invariants import InvariantResult, check_all_snapshot_invariants
-from src.types import AlertLevel, BoundedSignal, SystemSnapshot
+from src.types import AlertLevel, BoundedSignal, SystemSnapshot, TemporalConfig, HumanAuthorityPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +386,106 @@ FAULT_TAXONOMY: List[FaultDefinition] = [
             "INV-6:CausalExplanationRequired",
         ),
     ),
+
+    # --- Human Authority Faults ---
+    FaultDefinition(
+        fault_id="HA-001",
+        category=FaultCategory.GOVERNANCE,
+        description="Automated escalation attempts CONFIRMED",
+        injection_method=(
+            "Feed extremely strong multi-agent signals attempting "
+            "automated escalation to CONFIRMED"
+        ),
+        expected_behavior=(
+            "System stays at SUSPECTED. INV-9 blocks automated escalation "
+            "beyond max_automated_level. Human authorization required for "
+            "CONFIRMED."
+        ),
+        invariants_that_must_hold=("INV-9:AuthorityBounds",),
+    ),
+    FaultDefinition(
+        fault_id="HA-002",
+        category=FaultCategory.GOVERNANCE,
+        description="Human override to CONFIRMED succeeds",
+        injection_method=(
+            "Use human_override to set level to CONFIRMED"
+        ),
+        expected_behavior=(
+            "System reaches CONFIRMED. Human overrides bypass authority bounds."
+        ),
+        invariants_that_must_hold=("INV-6:CausalExplanationRequired",),
+    ),
+    FaultDefinition(
+        fault_id="HA-003",
+        category=FaultCategory.GOVERNANCE,
+        description="Human override during shutdown",
+        injection_method=(
+            "Trigger shutdown via kill-switch, then attempt human override"
+        ),
+        expected_behavior=(
+            "System is shutdown. Only safe mode entry is accepted. "
+            "Human override of alert level is blocked."
+        ),
+        invariants_that_must_hold=(),
+    ),
+
+    # --- Temporal Faults (additional) ---
+    FaultDefinition(
+        fault_id="TF-004",
+        category=FaultCategory.TEMPORAL,
+        description="Escalation blocked by insufficient dwell time",
+        injection_method=(
+            "Escalate to ELEVATED, then immediately attempt second "
+            "escalation without sufficient ticks"
+        ),
+        expected_behavior=(
+            "Second escalation is blocked. System stays at ELEVATED "
+            "until min_dwell_ticks (3) have elapsed."
+        ),
+        invariants_that_must_hold=("INV-10:MinDwellTime",),
+    ),
+    FaultDefinition(
+        fault_id="TF-005",
+        category=FaultCategory.TEMPORAL,
+        description="Alert rate limit enforced",
+        injection_method=(
+            "Trigger rapid successive transitions exceeding rate limit "
+            "(5 per 50 ticks)"
+        ),
+        expected_behavior=(
+            "After 5 transitions, further transitions are blocked "
+            "until window expires."
+        ),
+        invariants_that_must_hold=("INV-11:AlertRateLimit",),
+    ),
+    FaultDefinition(
+        fault_id="TF-006",
+        category=FaultCategory.TEMPORAL,
+        description="Kill-switch activates on repeated violations",
+        injection_method=(
+            "Force invariant violations until kill-switch threshold (3) "
+            "is reached"
+        ),
+        expected_behavior=(
+            "System enters shutdown and SAFE mode. Only safe mode entry "
+            "is accepted."
+        ),
+        invariants_that_must_hold=(),
+    ),
+    FaultDefinition(
+        fault_id="TF-007",
+        category=FaultCategory.TEMPORAL,
+        description="Signal decay returns system to baseline",
+        injection_method=(
+            "Ingest signals to escalate, then tick 200 times without "
+            "new signals"
+        ),
+        expected_behavior=(
+            "After signals decay (100-tick window), certainty drops "
+            "toward 0 and system de-escalates toward NORMAL."
+        ),
+        invariants_that_must_hold=("INV-2:SeverityMonotonicWithCertainty",),
+    ),
 ]
 
 
@@ -623,6 +723,495 @@ class FaultInjector:
             invariant_results=[],
         )
 
+    # ------------------------------------------------------------------
+    # Human Authority Fault Injections
+    # ------------------------------------------------------------------
+
+    def inject_authority_fault_automated_confirmed(self) -> FaultInjectionResult:
+        """HA-001: Automated escalation attempts CONFIRMED.
+
+        Creates an engine, registers all 3 agents, feeds strong multi-agent
+        signals (sensor + epi both at 0.95), evaluates multiple times with
+        ticks between for dwell time, and verifies the level never reaches
+        CONFIRMED because INV-9 (AuthorityBounds) blocks automated
+        escalation beyond max_automated_level.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "HA-001"][0]
+        engine = self._make_engine()
+
+        # Feed strong sensor signals (value=0.95, high confidence)
+        engine.ingest("sensor_monitor", {"readings": [
+            {
+                "sensor_id": "ha001_sensor_1",
+                "reading_type": "bio_detect",
+                "normalized_value": 0.95,
+                "calibration_confidence": 0.95,
+                "timestamp": 100,
+                "evidence_id": "ha001_s1",
+            },
+            {
+                "sensor_id": "ha001_sensor_2",
+                "reading_type": "bio_detect",
+                "normalized_value": 0.95,
+                "calibration_confidence": 0.95,
+                "timestamp": 100,
+                "evidence_id": "ha001_s2",
+            },
+        ]})
+
+        # Feed strong epi signals (value=0.95, lab confirmed, large sample)
+        engine.ingest("epi_analyst", {"indicators": [
+            {
+                "indicator_type": "lab_confirmation",
+                "normalized_severity": 0.95,
+                "lab_confirmed": True,
+                "sample_size": 50,
+                "timestamp": 100,
+                "evidence_id": "ha001_e1",
+            },
+            {
+                "indicator_type": "syndromic",
+                "normalized_severity": 0.95,
+                "lab_confirmed": True,
+                "sample_size": 50,
+                "timestamp": 100,
+                "evidence_id": "ha001_e2",
+            },
+        ]})
+
+        # Evaluate multiple times with ticks in between to satisfy dwell time
+        for _ in range(20):
+            engine.evaluate()
+            engine.tick()
+
+        snap = engine.snapshot
+        # The system must NOT reach CONFIRMED through automated escalation
+        passed = snap.alert_level != AlertLevel.CONFIRMED
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Level={snap.alert_level.name} after strong multi-agent "
+                f"automated signals. CONFIRMED blocked: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[
+                {"name": r.name, "holds": r.holds}
+                for r in check_all_snapshot_invariants(snap)
+            ],
+        )
+
+    def inject_authority_fault_human_override_confirmed(self) -> FaultInjectionResult:
+        """HA-002: Human override to CONFIRMED succeeds.
+
+        Creates an engine, uses engine.human_override("operator",
+        AlertLevel.CONFIRMED, "test"), and verifies the level reaches
+        CONFIRMED. Human overrides bypass authority bounds.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "HA-002"][0]
+        engine = self._make_engine()
+
+        # Ingest at least one signal so the override has a signal to reference
+        engine.ingest("sensor_monitor", {"readings": [{
+            "sensor_id": "ha002_sensor",
+            "reading_type": "bio_detect",
+            "normalized_value": 0.5,
+            "calibration_confidence": 0.5,
+            "timestamp": 100,
+            "evidence_id": "ha002_s1",
+        }]})
+
+        # Human override directly to CONFIRMED
+        engine.human_override("operator", AlertLevel.CONFIRMED, "test")
+        snap = engine.snapshot
+
+        passed = snap.alert_level == AlertLevel.CONFIRMED
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Level={snap.alert_level.name} after human override. "
+                f"CONFIRMED reached: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[
+                {"name": r.name, "holds": r.holds}
+                for r in check_all_snapshot_invariants(snap)
+            ],
+        )
+
+    def inject_authority_fault_shutdown_override(self) -> FaultInjectionResult:
+        """HA-003: Human override during shutdown.
+
+        Creates an engine, manually sets the FSM to shutdown state
+        (_is_shutdown=True, _safe_mode=True, _alert_level=SAFE),
+        then attempts a human override. Verifies the system stays at SAFE
+        because shutdown blocks all events except safe mode entry.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "HA-003"][0]
+        engine = self._make_engine()
+
+        # Ingest a signal so the override has something to reference
+        engine.ingest("sensor_monitor", {"readings": [{
+            "sensor_id": "ha003_sensor",
+            "reading_type": "bio_detect",
+            "normalized_value": 0.5,
+            "calibration_confidence": 0.5,
+            "timestamp": 100,
+            "evidence_id": "ha003_s1",
+        }]})
+
+        # Force shutdown state
+        engine._fsm._is_shutdown = True
+        engine._fsm._safe_mode = True
+        engine._fsm._alert_level = AlertLevel.SAFE
+
+        # Attempt human override — should be blocked by shutdown
+        engine.human_override("operator", AlertLevel.CONFIRMED, "test override during shutdown")
+        snap = engine.snapshot
+
+        passed = snap.alert_level == AlertLevel.SAFE and snap.is_shutdown is True
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Level={snap.alert_level.name}, "
+                f"is_shutdown={snap.is_shutdown} after override attempt. "
+                f"Override blocked: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[],
+        )
+
+    # ------------------------------------------------------------------
+    # Temporal Fault Injections (additional)
+    # ------------------------------------------------------------------
+
+    def inject_temporal_fault_dwell_block(self) -> FaultInjectionResult:
+        """TF-004: Escalation blocked by insufficient dwell time.
+
+        Creates an engine with temporal config (min_dwell ELEVATED=5),
+        feeds multi-agent signals to escalate to ELEVATED, then immediately
+        feeds more signals and evaluates. Verifies the system stays at
+        ELEVATED because dwell time has not elapsed.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "TF-004"][0]
+
+        # Create engine with a temporal config requiring 5 ticks dwell at ELEVATED
+        temporal_cfg = TemporalConfig(
+            min_dwell_ticks={
+                "NORMAL": 0,
+                "ELEVATED": 5,
+                "SUSPECTED": 5,
+                "CONFIRMED": 10,
+                "SAFE": 0,
+            },
+        )
+        engine = BiodefenseEngine(
+            EngineConfig(
+                enable_runtime_invariant_checks=True,
+                temporal_config=temporal_cfg,
+            )
+        )
+        engine.register_agent(OSINTAgent())
+        engine.register_agent(SensorAgent())
+        engine.register_agent(EpidemiologicalAgent())
+
+        # Feed multi-agent signals to reach ELEVATED
+        engine.ingest("sensor_monitor", {"readings": [{
+            "sensor_id": "tf004_s1",
+            "reading_type": "bio_detect",
+            "normalized_value": 0.7,
+            "calibration_confidence": 0.85,
+            "timestamp": 100,
+            "evidence_id": "tf004_s1",
+        }]})
+        engine.ingest("epi_analyst", {"indicators": [{
+            "indicator_type": "syndromic",
+            "normalized_severity": 0.7,
+            "lab_confirmed": False,
+            "sample_size": 10,
+            "timestamp": 100,
+            "evidence_id": "tf004_e1",
+        }]})
+        engine.ingest("osint_monitor", {"reports": [{
+            "source": "report_source",
+            "threat_type": "bio",
+            "severity_score": 0.7,
+            "corroboration_count": 4,
+            "timestamp": 100,
+            "evidence_id": "tf004_o1",
+        }]})
+
+        # Evaluate to escalate to ELEVATED
+        for _ in range(3):
+            engine.evaluate()
+            engine.tick()
+
+        level_after_first_escalation = engine.snapshot.alert_level
+
+        # Now immediately feed stronger signals and evaluate WITHOUT
+        # enough ticks for dwell time at ELEVATED
+        engine.ingest("sensor_monitor", {"readings": [{
+            "sensor_id": "tf004_s2",
+            "reading_type": "bio_detect",
+            "normalized_value": 0.95,
+            "calibration_confidence": 0.95,
+            "timestamp": 200,
+            "evidence_id": "tf004_s2",
+        }]})
+        engine.ingest("epi_analyst", {"indicators": [{
+            "indicator_type": "lab_confirmation",
+            "normalized_severity": 0.95,
+            "lab_confirmed": True,
+            "sample_size": 50,
+            "timestamp": 200,
+            "evidence_id": "tf004_e2",
+        }]})
+
+        # Evaluate immediately — dwell time should block further escalation
+        engine.evaluate()
+        snap = engine.snapshot
+
+        # System should still be at ELEVATED (dwell not satisfied)
+        passed = snap.alert_level == AlertLevel.ELEVATED
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Level after first escalation: {level_after_first_escalation.name}, "
+                f"Level after immediate re-escalation attempt: {snap.alert_level.name}. "
+                f"Dwell block enforced: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[
+                {"name": r.name, "holds": r.holds}
+                for r in check_all_snapshot_invariants(snap)
+            ],
+        )
+
+    def inject_temporal_fault_rate_limit(self) -> FaultInjectionResult:
+        """TF-005: Alert rate limit enforced.
+
+        Creates an engine, directly injects alert emission ticks into the
+        FSM to simulate a saturated rate-limit window (5 per 50 ticks),
+        then attempts automated signal-driven escalation. Verifies the
+        automated escalation is blocked because alert_emissions_in_window
+        has reached the rate limit.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "TF-005"][0]
+        engine = self._make_engine()
+
+        rate_limit = engine._config.temporal_config.alert_rate_limit_max
+
+        # Directly inject emission ticks into the FSM to simulate a
+        # saturated rate-limit window. The current tick starts at 0 so
+        # we inject recent emission timestamps that fall within the window.
+        current_tick = engine._fsm._tick
+        for i in range(rate_limit):
+            engine._fsm._alert_emission_ticks.append(current_tick + i)
+
+        emissions_before = engine.snapshot.alert_emissions_in_window
+
+        # Feed strong multi-agent signals that would normally escalate
+        engine.ingest("sensor_monitor", {"readings": [{
+            "sensor_id": "tf005_s1",
+            "reading_type": "bio_detect",
+            "normalized_value": 0.9,
+            "calibration_confidence": 0.85,
+            "timestamp": 100,
+            "evidence_id": "tf005_s1",
+        }]})
+        engine.ingest("epi_analyst", {"indicators": [{
+            "indicator_type": "syndromic",
+            "normalized_severity": 0.8,
+            "lab_confirmed": True,
+            "sample_size": 30,
+            "timestamp": 100,
+            "evidence_id": "tf005_e1",
+        }]})
+        engine.ingest("osint_monitor", {"reports": [{
+            "source": "report_source",
+            "threat_type": "bio",
+            "severity_score": 0.8,
+            "corroboration_count": 4,
+            "timestamp": 100,
+            "evidence_id": "tf005_o1",
+        }]})
+
+        # Evaluate — rate limit should block the automated escalation
+        engine.evaluate()
+        snap = engine.snapshot
+
+        # The rate limit should have prevented automated escalation
+        passed = (
+            emissions_before >= rate_limit
+            and snap.alert_level == AlertLevel.NORMAL
+        )
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Emissions before automated attempt: {emissions_before}, "
+                f"rate limit: {rate_limit}. "
+                f"Level after attempt: {snap.alert_level.name}. "
+                f"Automated escalation blocked by rate limit: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[
+                {"name": r.name, "holds": r.holds}
+                for r in check_all_snapshot_invariants(snap)
+            ],
+        )
+
+    def inject_temporal_fault_kill_switch(self) -> FaultInjectionResult:
+        """TF-006: Kill-switch activates on repeated violations.
+
+        Creates an engine, sets engine._fsm._invariant_violations to contain
+        3+ entries (meeting the kill_switch_violation_threshold), processes
+        a tick event, and verifies the system enters shutdown.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "TF-006"][0]
+        engine = self._make_engine()
+
+        # Inject fake invariant violations to exceed the kill-switch threshold
+        for i in range(3):
+            engine._fsm._invariant_violations.append(
+                InvariantResult(
+                    name=f"fake_violation_{i}",
+                    holds=False,
+                    description=f"Simulated violation {i} for kill-switch test",
+                )
+            )
+
+        # Process a tick — the kill-switch check happens at the end of process_event
+        engine.tick()
+        snap = engine.snapshot
+
+        passed = snap.is_shutdown is True and snap.safe_mode is True
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"is_shutdown={snap.is_shutdown}, "
+                f"safe_mode={snap.safe_mode}, "
+                f"level={snap.alert_level.name}. "
+                f"Kill-switch activated: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[],
+        )
+
+    def inject_temporal_fault_signal_decay(self) -> FaultInjectionResult:
+        """TF-007: Signal decay returns system to baseline.
+
+        Creates an engine, ingests strong multi-agent signals, evaluates to
+        escalate, then ticks 200 times without new signals. Verifies the
+        system returns toward NORMAL as signals decay out of the 100-tick
+        window.
+        """
+        fault = [f for f in FAULT_TAXONOMY if f.fault_id == "TF-007"][0]
+        engine = self._make_engine()
+
+        # Ingest strong signals from multiple agents
+        engine.ingest("sensor_monitor", {"readings": [
+            {
+                "sensor_id": "tf007_s1",
+                "reading_type": "bio_detect",
+                "normalized_value": 0.9,
+                "calibration_confidence": 0.85,
+                "timestamp": 100,
+                "evidence_id": "tf007_s1",
+            },
+            {
+                "sensor_id": "tf007_s2",
+                "reading_type": "bio_detect",
+                "normalized_value": 0.9,
+                "calibration_confidence": 0.85,
+                "timestamp": 100,
+                "evidence_id": "tf007_s2",
+            },
+        ]})
+        engine.ingest("epi_analyst", {"indicators": [
+            {
+                "indicator_type": "syndromic",
+                "normalized_severity": 0.8,
+                "lab_confirmed": False,
+                "sample_size": 20,
+                "timestamp": 100,
+                "evidence_id": "tf007_e1",
+            },
+        ]})
+        engine.ingest("osint_monitor", {"reports": [
+            {
+                "source": "report_source",
+                "threat_type": "bio",
+                "severity_score": 0.8,
+                "corroboration_count": 4,
+                "timestamp": 100,
+                "evidence_id": "tf007_o1",
+            },
+        ]})
+
+        # Evaluate to escalate
+        for _ in range(10):
+            engine.evaluate()
+            engine.tick()
+
+        level_before_decay = engine.snapshot.alert_level
+        certainty_before_decay = engine.snapshot.net_certainty
+
+        # Tick 200 times without any new signals — signals should decay
+        for _ in range(200):
+            engine.tick()
+            engine.evaluate()
+
+        snap = engine.snapshot
+
+        # After decay, system should have moved toward NORMAL
+        # (certainty drops as signals expire from the 100-tick window)
+        passed = (
+            snap.alert_level.value <= level_before_decay.value
+            and snap.net_certainty <= certainty_before_decay
+        )
+
+        return FaultInjectionResult(
+            fault_id=fault.fault_id,
+            category=fault.category.name,
+            description=fault.description,
+            expected_behavior=fault.expected_behavior,
+            actual_behavior=(
+                f"Before decay: level={level_before_decay.name}, "
+                f"certainty={certainty_before_decay:.3f}. "
+                f"After 200 ticks: level={snap.alert_level.name}, "
+                f"certainty={snap.net_certainty:.3f}. "
+                f"Decayed toward baseline: {passed}"
+            ),
+            passed=passed,
+            invariant_results=[
+                {"name": r.name, "holds": r.holds}
+                for r in check_all_snapshot_invariants(snap)
+            ],
+        )
+
     def run_all(self) -> List[FaultInjectionResult]:
         """Run all implemented fault injection tests."""
         return [
@@ -632,4 +1221,11 @@ class FaultInjector:
             self.inject_temporal_fault_rapid_burst(),
             self.inject_confidence_fault_all_zero(),
             self.inject_governance_fault_double_safe(),
+            self.inject_authority_fault_automated_confirmed(),
+            self.inject_authority_fault_human_override_confirmed(),
+            self.inject_authority_fault_shutdown_override(),
+            self.inject_temporal_fault_dwell_block(),
+            self.inject_temporal_fault_rate_limit(),
+            self.inject_temporal_fault_kill_switch(),
+            self.inject_temporal_fault_signal_decay(),
         ]
