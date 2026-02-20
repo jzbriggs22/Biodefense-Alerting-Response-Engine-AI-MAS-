@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bare"
+version = "0.1.0"
+description = "Biodefense Alerting & Response Engine — Multi-Agent System"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+bare = "bare.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["bare/tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["bare*"]
