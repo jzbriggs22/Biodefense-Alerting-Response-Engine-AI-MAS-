@@ -63,19 +63,19 @@ TRACEABILITY_MATRIX: List[TraceabilityLink] = [
     TraceabilityLink(
         spec_element="Init",
         impl_file="src/state_machine.py",
-        impl_element="BiodefenseStateMachine.__init__",
+        impl_element="BiodefenseStateMachine",
         verification_method="Constructor sets NORMAL, certainty=0, uncertainty=1",
     ),
     TraceabilityLink(
         spec_element="Next",
         impl_file="src/state_machine.py",
-        impl_element="BiodefenseStateMachine.process_event",
+        impl_element="process_event",
         verification_method="Single entry point for all state changes",
     ),
     TraceabilityLink(
         spec_element="EvaluateTransition",
         impl_file="src/state_machine.py",
-        impl_element="BiodefenseStateMachine._evaluate_transition",
+        impl_element="_evaluate_transition",
         verification_method="Guard checks match TLA+ Evaluate action",
     ),
     TraceabilityLink(

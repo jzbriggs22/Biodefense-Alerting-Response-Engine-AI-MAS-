@@ -6,3 +6,5 @@ regression/
 dist/
 build/
 .env
+.coverage
+htmlcov/
