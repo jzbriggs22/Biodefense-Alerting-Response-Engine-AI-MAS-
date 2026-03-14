@@ -41,40 +41,70 @@ SODA_ENDPOINT = "https://data.cdc.gov/resource/x9gk-5huc.json"
 
 # Diseases with biodefense relevance (CDC Category A/B/C bioterrorism agents
 # plus high-consequence emerging infections tracked by NNDSS).
+#
+# Labels match exact CDC NNDSS nomenclature as of 2025 reporting year.
+# See: https://data.cdc.gov/NNDSS/NNDSS-Weekly-Data/x9gk-5huc
 BIODEFENSE_DISEASES: Dict[str, float] = {
-    # Category A — highest priority
+    # ---- Category A — highest priority ----
     "Anthrax": 1.0,
-    "Botulism, total": 0.9,
-    "Plague": 1.0,
+    "Botulism, Foodborne": 0.9,
+    "Botulism, Infant": 0.7,
+    "Botulism, Other (wound & unspecified)": 0.9,
+    "Plague": 1.0,  # NNDSS reports all forms (bubonic, pneumonic, septicemic) under one label
     "Tularemia": 0.9,
     "Smallpox": 1.0,
-    # Category B
+    # ---- Category B ----
     "Brucellosis": 0.7,
-    "Q fever, total": 0.7,
+    "Q fever, Acute": 0.7,
+    "Q fever, Chronic": 0.7,
     "Psittacosis": 0.6,
-    # Category C — emerging
-    "Rift Valley fever virus disease": 0.8,
-    # High-consequence notifiable
-    "Meningococcal disease, all serogroups": 0.6,
-    "Rabies, human": 0.7,
-    "Viral hemorrhagic fevers": 0.95,
+    # ---- Viral hemorrhagic fevers (individually tracked since 2025) ----
+    "Viral hemorrhagic fevers, Ebola virus": 1.0,
+    "Viral hemorrhagic fevers, Marburg virus": 1.0,
+    "Viral hemorrhagic fevers, Lassa virus": 0.95,
+    "Viral hemorrhagic fevers, Crimean-Congo hemorrhagic fever virus": 0.95,
+    "Viral hemorrhagic fevers, Rift Valley fever virus": 0.9,
+    "Viral hemorrhagic fevers, Junin virus": 0.9,
+    "Viral hemorrhagic fevers, Machupo virus": 0.9,
+    "Viral hemorrhagic fevers, Guanarito virus": 0.9,
+    "Viral hemorrhagic fevers, Chapare virus": 0.9,
+    "Viral hemorrhagic fevers, Sabia virus": 0.9,
+    "Viral hemorrhagic fevers, Lujo virus": 0.9,
+    # ---- Other high-consequence notifiable ----
+    "Yellow fever": 0.85,
+    "Meningococcal disease, All serogroups": 0.6,
+    "Rabies, Human": 0.7,
 }
 
 # Baseline annual case counts (approximate US) for normalization.
 # Used to convert raw counts into [0, 1] severity scores.
+# A baseline of 0.0 means any reported case is maximally anomalous.
 BASELINE_ANNUAL_CASES: Dict[str, float] = {
     "Anthrax": 1.0,
-    "Botulism, total": 150.0,
-    "Plague": 7.0,
+    "Botulism, Foodborne": 20.0,
+    "Botulism, Infant": 100.0,
+    "Botulism, Other (wound & unspecified)": 30.0,
+    "Plague": 7.0,  # all clinical forms combined
     "Tularemia": 200.0,
-    "Smallpox": 0.0,
+    "Smallpox": 0.0,  # eradicated — any case is critical
     "Brucellosis": 120.0,
-    "Q fever, total": 170.0,
+    "Q fever, Acute": 130.0,
+    "Q fever, Chronic": 40.0,
     "Psittacosis": 15.0,
-    "Rift Valley fever virus disease": 0.0,
-    "Meningococcal disease, all serogroups": 350.0,
-    "Rabies, human": 3.0,
-    "Viral hemorrhagic fevers": 0.0,
+    "Viral hemorrhagic fevers, Ebola virus": 0.0,
+    "Viral hemorrhagic fevers, Marburg virus": 0.0,
+    "Viral hemorrhagic fevers, Lassa virus": 0.0,
+    "Viral hemorrhagic fevers, Crimean-Congo hemorrhagic fever virus": 0.0,
+    "Viral hemorrhagic fevers, Rift Valley fever virus": 0.0,
+    "Viral hemorrhagic fevers, Junin virus": 0.0,
+    "Viral hemorrhagic fevers, Machupo virus": 0.0,
+    "Viral hemorrhagic fevers, Guanarito virus": 0.0,
+    "Viral hemorrhagic fevers, Chapare virus": 0.0,
+    "Viral hemorrhagic fevers, Sabia virus": 0.0,
+    "Viral hemorrhagic fevers, Lujo virus": 0.0,
+    "Yellow fever": 0.0,
+    "Meningococcal disease, All serogroups": 350.0,
+    "Rabies, Human": 3.0,
 }
 
 # How many weeks of history to fetch per poll
