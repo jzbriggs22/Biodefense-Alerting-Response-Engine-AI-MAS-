@@ -1,0 +1,16 @@
+# Biodefense Alerting & Response Engine - Dependencies
+# Safety-critical: pin all versions exactly
+
+# Core
+dataclasses-json==0.6.3
+immutables==0.20
+
+# Testing
+pytest==8.3.4
+pytest-cov==6.0.0
+hypothesis==6.119.3
+
+# Formal verification support
+# TLA+ toolbox is external; these support model-code traceability
+pyyaml==6.0.2
+jsonschema==4.23.0
