@@ -1,0 +1,23 @@
+[project]
+name = "biodefense-bare"
+version = "0.1.0"
+description = "Biodefense Alerting & Response Engine — flight-grade multi-agent system"
+requires-python = ">=3.10"
+dependencies = [
+    "dataclasses-json==0.6.3",
+    "immutables==0.20",
+    "pyyaml==6.0.2",
+    "jsonschema==4.23.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.3.4",
+    "pytest-cov==6.0.0",
+    "hypothesis==6.119.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
